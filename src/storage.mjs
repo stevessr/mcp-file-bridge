@@ -161,6 +161,57 @@ export class UploadStore {
     }
   }
 
+  async receiveProvidedStream({ relativePath, stream, contentLength, expectedSha256 }) {
+    const { normalized, target } = resolveInside(this.filesDir, relativePath);
+    const expected = assertSha256(expectedSha256);
+    if (contentLength != null) {
+      if (!Number.isSafeInteger(contentLength) || contentLength < 0) throw new Error('invalid content length');
+      if (contentLength > this.maxFileBytes) throw new Error(`file exceeds MAX_FILE_BYTES (${this.maxFileBytes})`);
+    }
+    try {
+      await stat(target);
+      throw new Error(`destination already exists: ${normalized}`);
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
+
+    const part = path.join(this.uploadsDir, `${randomUUID()}${PART_SUFFIX}`);
+    const hash = createHash('sha256');
+    let received = 0;
+    const meter = new Transform({
+      transform(chunk, _encoding, callback) {
+        received += chunk.length;
+        if (received > this.maxFileBytes) return callback(new Error(`file exceeds MAX_FILE_BYTES (${this.maxFileBytes})`));
+        hash.update(chunk);
+        callback(null, chunk);
+      }
+    });
+    meter.maxFileBytes = this.maxFileBytes;
+
+    try {
+      await pipeline(stream, meter, createWriteStream(part, { flags: 'wx' }));
+      if (contentLength != null && received !== contentLength) {
+        throw new Error(`download incomplete: received ${received}/${contentLength} bytes`);
+      }
+      const actualSha256 = hash.digest('hex');
+      if (expected && actualSha256 !== expected) {
+        throw new Error(`sha256 mismatch: expected ${expected}, got ${actualSha256}`);
+      }
+      await mkdir(path.dirname(target), { recursive: true });
+      try {
+        await stat(target);
+        throw new Error(`destination already exists: ${normalized}`);
+      } catch (err) {
+        if (err?.code !== 'ENOENT') throw err;
+      }
+      await rename(part, target);
+      return { path: normalized, size_bytes: received, sha256: actualSha256 };
+    } catch (err) {
+      await rm(part, { force: true });
+      throw err;
+    }
+  }
+
   async uploadInfo(uploadId) {
     const manifest = await this.readManifest(uploadId);
     const { token_sha256: _secret, ...safe } = manifest;
