@@ -8,5 +8,6 @@ services:
       MCP_API_TOKEN: ${MCP_API_TOKEN:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:3000}
       MAX_FILE_BYTES: ${MAX_FILE_BYTES:-10737418240}
+      PROVIDED_FILE_HOST_SUFFIXES: ${PROVIDED_FILE_HOST_SUFFIXES:-openai.com,oaiusercontent.com,blob.core.windows.net}
     volumes:
       - ./data:/data
