@@ -1,0 +1,12 @@
+services:
+  mcp-file-bridge:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      MCP_API_TOKEN: ${MCP_API_TOKEN:-}
+      MAX_FILE_BYTES: ${MAX_FILE_BYTES:-536870912}
+      MAX_CHUNK_BYTES: ${MAX_CHUNK_BYTES:-524288}
+    volumes:
+      - ./data:/data
