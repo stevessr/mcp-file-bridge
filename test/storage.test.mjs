@@ -46,3 +46,24 @@ test('rejects a bad one-time upload token', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('stores a host-provided stream without base64 or MCP chunk arguments', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'mcp-file-bridge-'));
+  try {
+    const store = new UploadStore({ dataDir: dir, maxFileBytes: 1024 * 1024 });
+    await store.init();
+    const payload = Buffer.from('hello from host file bridge');
+    const sha256 = createHash('sha256').update(payload).digest('hex');
+    const result = await store.receiveProvidedStream({
+      relativePath: 'host/report.txt',
+      stream: Readable.from([payload]),
+      contentLength: payload.length,
+      expectedSha256: sha256
+    });
+    assert.equal(result.size_bytes, payload.length);
+    assert.equal(result.sha256, sha256);
+    assert.deepEqual(await readFile(path.join(dir, 'files/host/report.txt')), payload);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
