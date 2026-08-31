@@ -1,8 +1,8 @@
 {
   "name": "mcp-file-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "MCP control plane with direct streaming HTTP uploads for large sandbox artifacts.",
+  "description": "ChatGPT/Codex App file bridge using host-native file parameters, with direct HTTP streaming fallback.",
   "type": "module",
   "engines": {
     "node": ">=22"
