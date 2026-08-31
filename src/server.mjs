@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import process from 'node:process';
+import { Readable } from 'node:stream';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import * as z from 'zod/v4';
@@ -11,6 +12,8 @@ const DATA_DIR = process.env.DATA_DIR ?? '/data';
 const API_TOKEN = process.env.MCP_API_TOKEN ?? '';
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES ?? 10 * 1024 * 1024 * 1024);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL ?? `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
+const PROVIDED_FILE_HOST_SUFFIXES = (process.env.PROVIDED_FILE_HOST_SUFFIXES ?? 'openai.com,oaiusercontent.com,blob.core.windows.net')
+  .split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
 
 if (!Number.isSafeInteger(PORT) || PORT <= 0 || PORT > 65535) throw new Error('invalid PORT');
 if (!Number.isSafeInteger(MAX_FILE_BYTES) || MAX_FILE_BYTES <= 0) throw new Error('invalid MAX_FILE_BYTES');
@@ -21,8 +24,95 @@ await store.init();
 const text = (value) => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
 const failure = (err) => ({ isError: true, content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }] });
 
+const providedFileSchema = z.object({
+  download_url: z.string().url(),
+  file_id: z.string().min(1),
+  mime_type: z.string().optional(),
+  file_name: z.string().optional()
+});
+
+function hostMatchesSuffix(hostname, suffix) {
+  return hostname === suffix || hostname.endsWith(`.${suffix}`);
+}
+
+function validateProvidedFileUrl(raw) {
+  const url = new URL(raw);
+  if (url.protocol !== 'https:') throw new Error('provided file URL must use HTTPS');
+  if (url.username || url.password) throw new Error('provided file URL must not contain credentials');
+  if (url.port && url.port !== '443') throw new Error('provided file URL must use the default HTTPS port');
+  const host = url.hostname.toLowerCase();
+  if (!PROVIDED_FILE_HOST_SUFFIXES.some((suffix) => hostMatchesSuffix(host, suffix))) {
+    throw new Error(`provided file host is not allowed: ${host}`);
+  }
+  return url;
+}
+
+async function fetchProvidedFile(rawUrl, maxRedirects = 5) {
+  let current = validateProvidedFileUrl(rawUrl);
+  for (let i = 0; i <= maxRedirects; i += 1) {
+    const response = await fetch(current, { redirect: 'manual' });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location) throw new Error('provided file redirect is missing location');
+      current = validateProvidedFileUrl(new URL(location, current).toString());
+      continue;
+    }
+    if (!response.ok) throw new Error(`provided file download failed with HTTP ${response.status}`);
+    if (!response.body) throw new Error('provided file response has no body');
+    return response;
+  }
+  throw new Error('too many provided file redirects');
+}
+
+function defaultDestination(file) {
+  const candidate = file.file_name?.trim();
+  if (candidate) return candidate;
+  const safeId = file.file_id.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return `uploads/${safeId || 'file'}.bin`;
+}
+
 function factory() {
-  const server = new McpServer({ name: 'mcp-file-bridge', version: '0.2.0' });
+  const server = new McpServer({ name: 'mcp-file-bridge', version: '0.3.0' });
+
+  server.registerTool('ingest_file', {
+    description: 'Import a ChatGPT/Codex host file without putting file bytes or base64 in model context. Compatible hosts bind a local/attached file to this tool through openai/fileParams and send a temporary provided-file object.',
+    inputSchema: z.object({
+      file: providedFileSchema,
+      path: z.string().optional().describe('Destination path relative to storage. Defaults to the provided file name.'),
+      sha256: z.string().regex(/^[a-fA-F0-9]{64}$/).optional().describe('Optional expected SHA-256 for end-to-end integrity checking.')
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: true
+    },
+    _meta: {
+      'openai/fileParams': ['file']
+    }
+  }, async ({ file, path, sha256 }) => {
+    try {
+      const destination = path ?? defaultDestination(file);
+      const response = await fetchProvidedFile(file.download_url);
+      const lengthHeader = response.headers.get('content-length');
+      const contentLength = lengthHeader == null ? undefined : Number(lengthHeader);
+      if (contentLength != null && (!Number.isSafeInteger(contentLength) || contentLength < 0)) {
+        throw new Error('invalid provided file content-length');
+      }
+      const result = await store.receiveProvidedStream({
+        relativePath: destination,
+        stream: Readable.fromWeb(response.body),
+        contentLength,
+        expectedSha256: sha256
+      });
+      return text({
+        ...result,
+        source_file_id: file.file_id,
+        source_file_name: file.file_name ?? null,
+        mime_type: file.mime_type ?? response.headers.get('content-type') ?? null,
+        transfer: 'host-file-parameter'
+      });
+    } catch (err) { return failure(err); }
+  });
 
   server.registerTool('create_upload', {
     description: 'Create a short-lived direct HTTP upload session. The model only handles metadata; file bytes must be streamed by client-side code to upload_url.',
@@ -107,7 +197,7 @@ function bearer(req) {
 const httpServer = createServer((req, res) => {
   void (async () => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    if (url.pathname === '/healthz') return json(res, 200, { ok: true, service: 'mcp-file-bridge', version: '0.2.0' });
+    if (url.pathname === '/healthz') return json(res, 200, { ok: true, service: 'mcp-file-bridge', version: '0.3.0' });
 
     const uploadMatch = url.pathname.match(/^\/upload\/([0-9a-f-]{36})$/i);
     if (uploadMatch) {
